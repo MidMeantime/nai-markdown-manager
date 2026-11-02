@@ -1,0 +1,2018 @@
+/*---
+compatibilityVersion: naiscript-1.0
+id: cbca03f7-235d-4edc-b9e3-cebac44d21d8
+name: Mid's Markdown Manager
+createdAt: 1792807366033
+updatedAt: 1792807366033
+version: 1.0.1
+author: MidMeantime
+description: Import Markdown/text files into your story or Memory (append, replace matching chapters, or replace the whole story) and export your story or selected chapters to Markdown. Replaces Mid's Markdown Menagerie importer + exporter.
+memoryLimit: 8
+permissions:
+  - documentEdit
+  - storyEdit
+  - fileInput
+  - fileDownload
+config:
+  - name: default_import_header
+    prettyName: "[Import] Default Chapter Header Style"
+    type: select
+    options:
+      - label: "[ Chapter 1: Title ]"
+        value: "bracket"
+      - label: "[ Title ]"
+        value: "bracket_title"
+      - label: "Chapter 1: Title (plain)"
+        value: "clean"
+      - label: "# Chapter 1: Title"
+        value: "markdown_h1"
+      - label: "As written in the file"
+        value: "raw"
+      - label: "No header"
+        value: "none"
+    description: "How chapter headers are written into the story on import. You can still change it in the panel."
+  - name: import_heading_split
+    prettyName: "[Import] Which Markdown Headings Start Chapters"
+    type: select
+    options:
+      - label: "Auto (top heading level; a lone # title is skipped)"
+        value: "auto"
+      - label: "Every heading (#, ##, ### ...)"
+        value: "all"
+    description: "Auto splits on the highest heading level used in the file. A single '# Title' at the top of a file with ## chapters is treated as the file title. Headings that name a chapter ('### Chapter 3') always split."
+  - name: preserve_blank_lines
+    prettyName: "[Import] Keep Blank-Line Scene Breaks"
+    type: boolean
+    default: false
+    description: "Keep an empty paragraph where the file has 2+ blank lines in a row. When off, paragraphs use normal spacing."
+  - name: default_export_header
+    prettyName: "[Export] Default Chapter Heading Style"
+    type: select
+    options:
+      - label: "# Heading 1"
+        value: "markdown_h1"
+      - label: "## Heading 2"
+        value: "markdown_h2"
+      - label: "[ Chapter 1: Title ]"
+        value: "bracket"
+      - label: "Chapter 1: Title (plain)"
+        value: "clean"
+      - label: "As written in the story"
+        value: "raw"
+    description: "How chapter headers are written into exported Markdown. You can still change it in the panel."
+  - name: chapter_detection_mode
+    prettyName: "[Detection] Header Detection Mode"
+    type: select
+    options:
+      - label: "Auto (Headings, Brackets & Keywords)"
+        value: "auto"
+      - label: "Markdown Headings Only"
+        value: "markdown_headings"
+    description: "Which lines count as chapter headers: 'auto' (Markdown #, [bracketed] titles, standalone 'Chapter X' lines) or Markdown headings only. Same rules as Chapter Linter."
+  - name: detect_bracketed_titles
+    prettyName: "[Detection] Detect Bracketed Titles"
+    type: boolean
+    default: true
+    description: "Detect bracketed headers like [ Chapter 1: The Beginning ] or [ Title ]. Bracketed metadata such as [ Author: X; Tags: Y ] is always ignored."
+  - name: chapter_break_token
+    prettyName: "[Detection] Chapter Break Token"
+    type: string
+    default: "***"
+    description: "Scene break written above chapter headers (and recognised besides *** / --- / ___)."
+---*/
+/**
+ * Mid's Markdown Manager for NovelAI
+ *
+ * One sidebar panel with two tabs:
+ * - Import: load a .md/.txt file, then append it, replace the matching chapters in place,
+ *   replace the whole story, or add it to Memory.
+ * - Export: save the whole story or selected chapters as Markdown, with optional frontmatter,
+ *   Memory / Author's Note, and an option to remove exported chapters from the story.
+ *
+ * Built from: markdown-manager/src/* + shared/chapter-headers.ts (see Editorial/package.json).
+ */
+
+// --- Shared Chapter Header Toolkit (Editorial scripts) ---
+// One parser for chapter headers, used by Chapter Linter and Markdown Manager.
+// Source of truth: Editorial/shared/chapter-headers.ts. Bundled into each script at build time,
+// so every name here is prefixed with `ch` / `CH_` to stay clear of script-level names.
+
+/** What a header introduces. 'title' = a header with no keyword ("# The Gathering", "[The Long Night]") */
+type ChapterKind = 'chapter' | 'title' | 'prologue' | 'epilogue' | 'interlude' | 'division';
+
+/** How the header was written in the source text */
+type HeaderSyntax = 'markdown' | 'bracket' | 'keyword';
+
+interface HeaderDetectionOptions {
+    /** 'auto' = markdown headings, [bracketed] titles and standalone "Chapter X" lines */
+    detectionMode: 'auto' | 'markdown_headings';
+    detectBracketedTitles: boolean;
+    /** Extra divider token recognised besides *** / --- / ___ */
+    breakToken?: string;
+    /** Only the breakToken counts as a divider (a lone --- stays text) */
+    onlyBreakToken?: boolean;
+}
+
+interface ParsedHeader {
+    isHeader: boolean;
+    syntax: HeaderSyntax | null;
+    /** Markdown heading level (1-6); 0 for bracket/keyword headers */
+    level: number;
+    kind: ChapterKind;
+    /** Label prefix exactly as written, minus trailing separator: "Chapter 3", "Part 1: Chapter 3", "IV", "" */
+    labelText: string;
+    /** Innermost keyword ("Chapter", "Part", "Prologue"); "" for bare numbers and titles */
+    keyword: string;
+    /** Innermost number as written ("IV", "8", "Twenty-One"); "" when there is none */
+    numberText: string;
+    /** Innermost number as a value, or null */
+    number: number | null;
+    /** Title text after the label: "The Dark Forest"; "" when the header is only a label */
+    cleanName: string;
+    /** The paragraph started with its own divider line ("***\n# Chapter 1") */
+    hasEmbeddedDivider: boolean;
+}
+
+const CH_DEFAULT_DETECTION: HeaderDetectionOptions = { detectionMode: 'auto', detectBracketedTitles: true };
+
+// Separators allowed between a label and its title: ":", "-", en/em dash, ".", "|"
+const CH_SEP = "[:\\-\\u2013\\u2014.|]";
+// Spelled-out numbers, including hyphenated/spaced compounds ("Twenty-One", "Thirty Two")
+const CH_NUMBER_WORD = "(?:(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[-\\s](?:one|two|three|four|five|six|seven|eight|nine))?"
+    + "|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen"
+    + "|ten|one|two|three|four|five|six|seven|eight|nine|zero|hundred)";
+// Only well-formed numerals, so words like "Mill" or "Mild" are never read as numbers
+const CH_ROMAN = "(?=[MDCLXVI])M{0,3}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})";
+const CH_NUMBER = `(?:\\d+|${CH_ROMAN}|${CH_NUMBER_WORD})`;
+const CH_CHAPTER_KEYWORD = "(?:Chapter|Ch\\.?)";
+const CH_DIVISION_KEYWORD = "(?:Act|Book|Part|Volume|Section|Arc)";
+const CH_KEYWORD = `(?:${CH_CHAPTER_KEYWORD}|${CH_DIVISION_KEYWORD})`;
+const CH_LABEL_END = `(?=\\s|${CH_SEP}|,|$)`;
+
+// A plain line that is ONLY a label (optionally + separator + title). Anchored to the whole line
+// so prose like "Part of me wanted..." is never mistaken for a header.
+// Unnumbered special sections. Prelude counts as a prologue, Interlude sits between chapters.
+const CH_SPECIAL = "(?:Prologue|Prelude|Epilogue|Interlude)";
+// A comma only counts when another label follows it ("Part 1, Chapter 3"), never before prose.
+const CH_KEYWORD_LINE = new RegExp(
+    `^(?:${CH_KEYWORD}(?:\\s+${CH_NUMBER})?|${CH_SPECIAL})(?:\\s*${CH_SEP}.*|\\s*,\\s*(?:${CH_KEYWORD}|${CH_SPECIAL})${CH_LABEL_END}.*)?$`, 'i'
+);
+// Leading "Chapter 4", "Part II", "Ch. Twenty-One" (number optional). Groups: 1 keyword, 2 number
+const CH_LABEL_PREFIX = new RegExp(`^(${CH_KEYWORD})(?:\\s+(${CH_NUMBER}))?${CH_LABEL_END}`, 'i');
+const CH_DIVISION_TEST = new RegExp(`^${CH_DIVISION_KEYWORD}$`, 'i');
+// Keys that may label a bracketed header, e.g. [Chapter 3: ...], [Title: ...]
+const CH_BRACKET_KEY = new RegExp(`^(?:${CH_KEYWORD}(?:\\s+${CH_NUMBER})?|Title|${CH_SPECIAL})$`, 'i');
+// A bare number with no keyword, e.g. the "1" in "[ 1: Sandor ]". Roman numerals must be
+// uppercase here so short words like "Mid" or "Ivy" aren't read as numbers.
+const CH_BARE_NUMBER_PATTERNS: RegExp[] = [
+    new RegExp(`^(\\d+|${CH_ROMAN})`),
+    new RegExp(`^(${CH_NUMBER_WORD})`, 'i')
+];
+const CH_MAX_BRACKET_LENGTH = 100;
+
+const CH_WORD_VALUES: Record<string, number> = {
+    zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+    eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17,
+    eighteen: 18, nineteen: 19, twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60,
+    seventy: 70, eighty: 80, ninety: 90, hundred: 100
+};
+const CH_ROMAN_VALUES: Record<string, number> = { I: 1, V: 5, X: 10, L: 50, C: 100, D: 500, M: 1000 };
+const CH_ROMAN_TABLE: [number, string][] = [
+    [1000, "M"], [900, "CM"], [500, "D"], [400, "CD"], [100, "C"], [90, "XC"],
+    [50, "L"], [40, "XL"], [10, "X"], [9, "IX"], [5, "V"], [4, "IV"], [1, "I"]
+];
+
+function chToRoman(num: number): string {
+    if (num <= 0 || num > 3999) return String(num);
+    let result = "";
+    let rem = num;
+    for (const [val, roman] of CH_ROMAN_TABLE) {
+        while (rem >= val) {
+            result += roman;
+            rem -= val;
+        }
+    }
+    return result;
+}
+
+/** "12" -> 12, "IV"/"iv" -> 4, "Twenty-One" -> 21. Returns null for anything else. */
+function chParseNumber(token: string): number | null {
+    const t = (token || "").trim();
+    if (!t) return null;
+    if (/^\d+$/.test(t)) return parseInt(t, 10);
+    if (new RegExp(`^${CH_ROMAN}$`, 'i').test(t)) {
+        const upper = t.toUpperCase();
+        let total = 0;
+        let prev = 0;
+        for (let i = upper.length - 1; i >= 0; i--) {
+            const val = CH_ROMAN_VALUES[upper[i]] || 0;
+            if (val < prev) {
+                total -= val;
+            } else {
+                total += val;
+                prev = val;
+            }
+        }
+        return total > 0 ? total : null;
+    }
+    const words = t.toLowerCase().split(/[-\s]+/).filter((w: string) => w.length > 0);
+    if (words.length === 0 || words.length > 2) return null;
+    let sum = 0;
+    for (const w of words) {
+        const v = CH_WORD_VALUES[w];
+        if (v === undefined) return null;
+        sum += v;
+    }
+    return sum;
+}
+
+function chIsDivider(text: string, customToken?: string, onlyCustom: boolean = false): boolean {
+    if (!text) return false;
+    const t = text.trim();
+    if (!t) return false;
+    if (customToken && customToken.trim() && t === customToken.trim()) return true;
+    if (onlyCustom && customToken && customToken.trim()) return false;
+    if (t === "– – –" || t === "— — —") return true;
+    return /^(?:\*\s*){3,}$/.test(t) || /^(?:-\s*){3,}$/.test(t) || /^(?:_\s*){3,}$/.test(t);
+}
+
+// Length of a leading bare number (plus separator) when it ends the text or is followed by a
+// separator; 0 otherwise, so a title like "1984" or "Ivy" is left alone.
+function chMatchBareNumberPrefix(text: string, requireWhole: boolean = false): number {
+    for (const pattern of CH_BARE_NUMBER_PATTERNS) {
+        const m = text.match(pattern);
+        if (!m || !m[0]) continue;
+        const after = text.slice(m[0].length);
+        if (requireWhole) {
+            if (after.trim() === "") return text.length;
+            continue;
+        }
+        const sep = after.match(new RegExp(`^\\s*(?:${CH_SEP}\\s*|$)`));
+        if (sep) return m[0].length + sep[0].length;
+    }
+    return 0;
+}
+
+/**
+ * Inner text of a bracketed header, or null when the brackets hold something else
+ * (NovelAI author's notes / ATTG metadata such as "[ Author: X; Tags: Y ]").
+ */
+function chExtractBracketBody(text: string): string | null {
+    const m = text.match(/^\[\s*([^\[\]\n]+?)\s*\]$/);
+    if (!m) return null;
+    const inner = m[1];
+    if (inner.length > CH_MAX_BRACKET_LENGTH || inner.includes(";")) return null;
+    const keyMatch = inner.match(/^([^:]+?)\s*:/);
+    if (keyMatch) {
+        const key = keyMatch[1].trim();
+        if (!CH_BRACKET_KEY.test(key) && !chMatchBareNumberPrefix(key, true)) return null;
+    } else if (/[.!?\u2026]["'\u201D\u2019]?$/.test(inner) && !CH_KEYWORD_LINE.test(inner)) {
+        // "[He looked away.]" is an aside, not a title. "[Chapter 7.]" still counts.
+        return null;
+    }
+    return inner;
+}
+
+/** "Prologue: The Fall" -> { kind: 'prologue', keyword: 'Prologue', rest: 'The Fall' } */
+function chMatchSpecial(text: string): { kind: ChapterKind; keyword: string; rest: string } | null {
+    const m = text.match(new RegExp(`^(${CH_SPECIAL})${CH_LABEL_END}\\s*${CH_SEP}?\\s*(.*)$`, 'i'));
+    if (!m) return null;
+    const lower = m[1].toLowerCase();
+    const kind: ChapterKind = lower === 'epilogue' ? 'epilogue' : lower === 'interlude' ? 'interlude' : 'prologue';
+    return { kind, keyword: m[1], rest: m[2] };
+}
+
+/**
+ * Fills in chapter numbers the way readers expect: explicit numbers are kept, an unnumbered
+ * chapter gets the previous number + 1 (so an untitled chapter after "Chapter 5" is 6), and
+ * the first unnumbered chapter is 1. Prologue / epilogue / interlude / division get null.
+ */
+function chFillNumbers(headers: (ParsedHeader | null)[]): (number | null)[] {
+    let last = 0;
+    return headers.map((h: ParsedHeader | null) => {
+        if (!h || !h.isHeader) return null;
+        if (h.kind !== 'chapter' && h.kind !== 'title') return null;
+        const n = h.number !== null ? h.number : last + 1;
+        last = n;
+        return n;
+    });
+}
+
+function chNotHeader(): ParsedHeader {
+    return {
+        isHeader: false, syntax: null, level: 0, kind: 'title', labelText: "", keyword: "",
+        numberText: "", number: null, cleanName: "", hasEmbeddedDivider: false
+    };
+}
+
+/**
+ * Parses one paragraph/line. Returns isHeader=false for prose, dividers, metadata brackets
+ * and anything spanning several lines.
+ */
+function chParseHeader(raw: string, options: HeaderDetectionOptions = CH_DEFAULT_DETECTION): ParsedHeader {
+    const result = chNotHeader();
+    if (!raw) return result;
+    let working = raw.trim();
+    if (!working || chIsDivider(working, options.breakToken, options.onlyBreakToken)) return result;
+
+    // Allow a divider sharing the paragraph on its own first line, e.g. "***\n# Chapter 1"
+    const newlineIdx = working.indexOf("\n");
+    if (newlineIdx !== -1 && chIsDivider(working.slice(0, newlineIdx), options.breakToken, options.onlyBreakToken)) {
+        working = working.slice(newlineIdx + 1).trim();
+        result.hasEmbeddedDivider = true;
+    }
+    if (!working || working.includes("\n")) return chNotHeader();
+
+    let body: string | null = null;
+    const mdMatch = working.match(/^(#{1,6})\s+(.+)$/);
+    if (mdMatch) {
+        body = mdMatch[2];
+        result.syntax = 'markdown';
+        result.level = mdMatch[1].length;
+    } else if (options.detectionMode === 'auto') {
+        if (working.startsWith("[")) {
+            if (options.detectBracketedTitles) {
+                body = chExtractBracketBody(working);
+                result.syntax = 'bracket';
+            }
+        } else {
+            // Keyword lines, optionally wrapped in emphasis: "Chapter IV: Echoes", "**Part Two**"
+            const emphasis = working.match(/^(\*\*|__|\*|_)(.+)\1$/);
+            const candidate = (emphasis ? emphasis[2] : working).trim();
+            if (CH_KEYWORD_LINE.test(candidate)) {
+                body = candidate;
+                result.syntax = 'keyword';
+            }
+        }
+    }
+    if (body === null) return chNotHeader();
+    result.isHeader = true;
+
+    const full = body.trim();
+    let rest = full.replace(/^Title\s*:\s*/i, '');
+    let labelEnd = 0; // characters of `rest` (pre-strip) that belong to the label
+
+    const special = chMatchSpecial(rest);
+    if (special) {
+        result.kind = special.kind;
+        result.keyword = special.keyword;
+        result.labelText = special.keyword;
+        rest = special.rest;
+    } else {
+        // Strip stacked labels ("Part 1: Chapter 3: Title" -> "Title"). A bare keyword is only
+        // stripped when followed by a separator or nothing, so "# Part of the Plan" keeps its words.
+        const original = rest;
+        let consumed = 0;
+        let strippedLabel = false;
+        let label = rest.match(CH_LABEL_PREFIX);
+        while (label) {
+            const after = rest.slice(label[0].length);
+            const hasNumber = !!label[2];
+            if (!hasNumber && !new RegExp(`^\\s*(?:${CH_SEP}|$)`).test(after)) break;
+            result.keyword = label[1];
+            result.numberText = label[2] || "";
+            result.kind = CH_DIVISION_TEST.test(label[1]) ? 'division' : 'chapter';
+            consumed += label[0].length;
+            labelEnd = consumed;
+            // A comma also separates stacked labels: "Part 1, Chapter 3"
+            const sepMatch = after.match(new RegExp(`^\\s*(?:${CH_SEP}|,)?\\s*`));
+            const sepLen = sepMatch ? sepMatch[0].length : 0;
+            consumed += sepLen;
+            rest = after.slice(sepLen);
+            strippedLabel = true;
+            label = rest.match(CH_LABEL_PREFIX);
+        }
+        // "Act II: Prologue" / "Part 1, Interlude": a special section inside a division
+        const innerSpecial = strippedLabel && result.kind === 'division' ? chMatchSpecial(rest) : null;
+        if (innerSpecial) {
+            result.kind = innerSpecial.kind;
+            result.keyword = innerSpecial.keyword;
+            result.numberText = "";
+            labelEnd = consumed + (rest.length - innerSpecial.rest.length);
+            result.labelText = original.slice(0, labelEnd).replace(new RegExp(`\\s*${CH_SEP}?\\s*$`), '').trim();
+            rest = innerSpecial.rest;
+        } else if (strippedLabel) {
+            result.labelText = original.slice(0, labelEnd).trim();
+        } else {
+            // Keyword-less number left by imports: "1: Sandor" -> "Sandor", "12" -> "".
+            // Skipped after a real label so a numeric title ("Chapter 3: 1984") survives.
+            const bareLen = chMatchBareNumberPrefix(rest);
+            if (bareLen > 0) {
+                const token = rest.slice(0, bareLen).replace(new RegExp(`\\s*${CH_SEP}?\\s*$`), '');
+                result.kind = 'chapter';
+                result.numberText = token;
+                result.labelText = token;
+                rest = rest.slice(bareLen);
+            } else {
+                result.kind = 'title';
+            }
+        }
+    }
+
+    result.number = result.numberText ? chParseNumber(result.numberText) : null;
+    result.cleanName = rest
+        .replace(new RegExp(`^${CH_SEP}\\s*`), '')
+        .replace(new RegExp(`\\s*${CH_SEP}$`), '')
+        .replace(/^["'\[\]]+|["'\[\]]+$/g, '')
+        .trim();
+    // "[Title: X]" or "# X" with nothing left: keep the header, it is just untitled
+    return result;
+}
+
+/**
+ * Human-readable title for a parsed header: "Chapter 3: The Fall", "Prologue", "Part 2: Return",
+ * "The Gathering". Bare numbers ("[ 1: Sandor ]") are shown as "Chapter 1: Sandor".
+ */
+function chDisplayTitle(h: ParsedHeader): string {
+    if (!h.isHeader) return "";
+    let label = h.labelText;
+    if (h.kind === 'chapter' && !h.keyword && h.numberText) {
+        label = `Chapter ${h.numberText}`;
+    }
+    if (label && h.cleanName) return `${label}: ${h.cleanName}`;
+    return label || h.cleanName;
+}
+
+/** Normalised text for comparing titles: lowercase, punctuation and extra spaces removed */
+function chNormalizeTitle(text: string): string {
+    // Only ASCII punctuation is dropped, so accented and non-Latin titles still compare
+    return (text || "").toLowerCase().replace(/[!-\/:-@\[-`{-~–—‘’“”]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Removes markdown emphasis (*x*, **x**, ***x***, _x_, __x__) without touching scene dividers,
+ * bullet markers, or underscores inside words (snake_case, file_names).
+ */
+function chStripEmphasis(line: string, breakToken?: string): string {
+    if (!line || chIsDivider(line, breakToken)) return line;
+    let out = line;
+    out = out.replace(/\*\*\*(\S(?:[^*\n]*?\S)?)\*\*\*/g, "$1");
+    out = out.replace(/\*\*(\S(?:[^*\n]*?\S)?)\*\*/g, "$1");
+    out = out.replace(/\*(\S(?:[^*\n]*?\S)?)\*/g, "$1");
+    // Underscore emphasis only counts at word boundaries
+    out = out.replace(/(^|[^A-Za-z0-9_])___(\S(?:[^_\n]*?\S)?)___(?![A-Za-z0-9_])/g, "$1$2");
+    out = out.replace(/(^|[^A-Za-z0-9_])__(\S(?:[^_\n]*?\S)?)__(?![A-Za-z0-9_])/g, "$1$2");
+    out = out.replace(/(^|[^A-Za-z0-9_])_(\S(?:[^_\n]*?\S)?)_(?![A-Za-z0-9_])/g, "$1$2");
+    return out;
+}
+
+/** Word count without allocating large arrays */
+function chCountWords(str: string): number {
+    if (!str) return 0;
+    let count = 0;
+    let inWord = false;
+    for (let i = 0; i < str.length; i++) {
+        if (str.charCodeAt(i) > 32) {
+            if (!inWord) {
+                count++;
+                inWord = true;
+            }
+        } else {
+            inWord = false;
+        }
+    }
+    return count;
+}
+
+// --- Markdown Manager Types ---
+// Header parsing types (ParsedHeader, ChapterKind, HeaderDetectionOptions) come from shared/chapter-headers.ts
+
+type MdmHeaderStyle = 'bracket' | 'bracket_title' | 'markdown_h1' | 'markdown_h2' | 'clean' | 'raw' | 'none';
+type MdmFrontmatter = 'yaml' | 'toml' | 'none';
+type MdmTab = 'import' | 'export';
+type MdmImportTarget = 'document' | 'memory';
+type MdmExportScope = 'all' | 'selected';
+type MdmMatchConfidence = 'exact' | 'number' | 'title' | 'manual' | 'none';
+
+/** A user override for where one imported chapter goes */
+type MdmTargetChoice =
+    | { mode: 'auto' }
+    | { mode: 'editor'; key: number }
+    | { mode: 'append' }
+    | { mode: 'skip' };
+
+/** One chapter parsed out of an imported Markdown file */
+interface MdmFileChapter {
+    id: number;
+    /** null for text before the first header (or a file with no headers) */
+    header: ParsedHeader | null;
+    /** Header line exactly as written in the file */
+    rawHeader: string;
+    /** Display title, e.g. "Chapter 8" or "Opening text" */
+    title: string;
+    bodyLines: string[];
+    wordCount: number;
+}
+
+interface MdmLoadedFile {
+    title: string;
+    hasFrontmatter: boolean;
+    sizeBytes: number;
+    chapters: MdmFileChapter[];
+}
+
+/** One chapter found in the story document */
+interface MdmEditorChapter {
+    /** Stable identity: the header's section id (or the first section id for untitled text) */
+    key: number;
+    index: number;
+    header: ParsedHeader | null;
+    rawHeader: string;
+    title: string;
+    /** Every section that belongs to the chapter, including a leading *** and empty lines */
+    sectionIds: number[];
+    /** Non-empty body paragraphs (no header, no leading divider) */
+    bodyTexts: string[];
+    wordCount: number;
+    /** Nothing but empty lines comes before this chapter */
+    startsDocument: boolean;
+}
+
+interface MdmChapterMatch {
+    importId: number;
+    action: 'replace' | 'append' | 'skip';
+    editorKey: number | null;
+    confidence: MdmMatchConfidence;
+    reason: string;
+}
+
+interface MdmImportSettings {
+    headerStyle: MdmHeaderStyle;
+    includeDivider: boolean;
+    stripEmphasis: boolean;
+    preserveBlankLines: boolean;
+    appendUnmatched: boolean;
+    target: MdmImportTarget;
+}
+
+interface MdmExportSettings {
+    headerStyle: MdmHeaderStyle;
+    includeDivider: boolean;
+    stripEmphasis: boolean;
+    frontmatter: MdmFrontmatter;
+    includeStats: boolean;
+    includeMemory: boolean;
+    includeAuthorsNote: boolean;
+    stripAfterExport: boolean;
+    scope: MdmExportScope;
+}
+
+interface MdmSettings {
+    tab: MdmTab;
+    import: MdmImportSettings;
+    export: MdmExportSettings;
+}
+
+interface MdmState {
+    settings: MdmSettings;
+    detection: HeaderDetectionOptions;
+    headingSplit: 'auto' | 'all';
+    file: MdmLoadedFile | null;
+    manualTargets: Record<number, MdmTargetChoice>;
+    editorChapters: MdmEditorChapter[];
+    hasScanned: boolean;
+    storyTitle: string;
+    /** Chapter keys ticked for a "Selected" export */
+    exportSelected: Set<number>;
+    /** Keys seen by the export list, so new chapters start ticked and old ticks survive a re-scan */
+    exportKnownKeys: Set<number>;
+    busy: boolean;
+}
+
+/** Inputs for building an export file (gathered from the story at export time) */
+interface MdmExportMeta {
+    title: string;
+    author: string;
+    description: string;
+    memory: string;
+    authorsNote: string;
+    date: string;
+}
+
+// --- Markdown Manager Core (pure logic, no api calls) ---
+
+const MDM_EST_CHARS_PER_TOKEN = 3.6;
+
+function mdmUtf8Length(str: string): number {
+    let bytes = 0;
+    for (let i = 0; i < str.length; i++) {
+        const code = str.charCodeAt(i);
+        if (code < 0x80) bytes += 1;
+        else if (code < 0x800) bytes += 2;
+        else if (code >= 0xd800 && code <= 0xdbff) { bytes += 4; i++; }
+        else bytes += 3;
+    }
+    return bytes;
+}
+
+function mdmFormatSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function mdmEstimateTokens(chars: number): number {
+    return Math.ceil(chars / MDM_EST_CHARS_PER_TOKEN);
+}
+
+function mdmSanitizeFileName(name: string): string {
+    let clean = (name || "").replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').replace(/\s+/g, ' ').trim();
+    if (!clean) clean = "Story Export";
+    if (!/\.(md|txt)$/i.test(clean)) clean += ".md";
+    return clean;
+}
+
+// --- Frontmatter ---
+
+/** Reads a scalar value from a frontmatter line, removing matching quotes */
+function mdmFrontmatterValue(block: string, key: string, assign: ':' | '='): string {
+    const re = new RegExp(`^${key}\\s*${assign === ':' ? ':' : '='}\\s*(.+)$`, 'im');
+    const m = block.match(re);
+    if (!m) return "";
+    let v = m[1].trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+        v = v.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+    }
+    return v.trim();
+}
+
+/** Strips YAML (---), TOML (+++) or /*--- *\/ frontmatter and returns the title it held */
+function mdmStripFrontmatter(raw: string): { text: string; title: string; hasFrontmatter: boolean } {
+    let text = (raw || "").replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+    const patterns: { re: RegExp; assign: ':' | '=' }[] = [
+        { re: /^\/\*---\n([\s\S]*?)\n---\*\/[ \t]*(?:\n|$)/, assign: ':' },
+        { re: /^---\n([\s\S]*?)\n---[ \t]*(?:\n|$)/, assign: ':' },
+        { re: /^\+\+\+\n([\s\S]*?)\n\+\+\+[ \t]*(?:\n|$)/, assign: '=' }
+    ];
+    for (const p of patterns) {
+        const m = text.match(p.re);
+        if (m) {
+            const title = mdmFrontmatterValue(m[1], 'title', p.assign) || mdmFrontmatterValue(m[1], 'name', p.assign);
+            return { text: text.slice(m[0].length), title, hasFrontmatter: true };
+        }
+    }
+    return { text, title: "", hasFrontmatter: false };
+}
+
+function mdmYamlString(value: string): string {
+    return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`;
+}
+
+function mdmYamlBlock(key: string, value: string): string {
+    return `${key}: |\n${value.split('\n').map((l: string) => `  ${l}`).join('\n')}`;
+}
+
+function mdmTomlString(value: string): string {
+    return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`;
+}
+
+function mdmTomlBlock(key: string, value: string): string {
+    return `${key} = """\n${value.replace(/\\/g, '\\\\').replace(/"""/g, '\\"""')}\n"""`;
+}
+
+// --- Header formatting (shared by import and export) ---
+
+/**
+ * Header line for a chapter in the chosen style. `raw` is the header as written in the source.
+ * Returns "" for 'none' and for chapters without a header.
+ */
+function mdmFormatHeaderLine(header: ParsedHeader | null, raw: string, style: MdmHeaderStyle): string {
+    if (!header || !header.isHeader) return "";
+    const display = chDisplayTitle(header) || header.cleanName || raw.trim();
+    switch (style) {
+        case 'bracket': return `[ ${display} ]`;
+        case 'bracket_title': return `[ ${header.cleanName || display} ]`;
+        case 'markdown_h1': return `# ${display}`;
+        case 'markdown_h2': return `## ${display}`;
+        case 'clean': return display;
+        case 'raw': return raw.trim();
+        case 'none': return "";
+    }
+    return display;
+}
+
+// --- Importing: Markdown file -> chapters ---
+
+function mdmMakeFileChapter(id: number, header: ParsedHeader | null, rawHeader: string, bodyLines: string[], fallbackTitle: string): MdmFileChapter {
+    // Trim blank lines at both ends of the body
+    let start = 0;
+    let end = bodyLines.length;
+    while (start < end && !bodyLines[start].trim()) start++;
+    while (end > start && !bodyLines[end - 1].trim()) end--;
+    const body = bodyLines.slice(start, end);
+    return {
+        id,
+        header,
+        rawHeader,
+        title: header ? (chDisplayTitle(header) || rawHeader.trim()) : fallbackTitle,
+        bodyLines: body,
+        wordCount: chCountWords(body.join('\n'))
+    };
+}
+
+/**
+ * Picks which markdown heading level starts a chapter. 'auto': the highest level used, except a
+ * lone level-1 heading at the very top of a file that also has deeper headings (the file title).
+ */
+function mdmPickSplitLevel(lines: string[], mode: 'auto' | 'all', detection: HeaderDetectionOptions): { level: number; titleLine: number } {
+    if (mode === 'all') return { level: 6, titleLine: -1 };
+    const levels: { line: number; level: number }[] = [];
+    for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(/^(#{1,6})\s+\S/);
+        if (m) levels.push({ line: i, level: m[1].length });
+    }
+    if (levels.length === 0) return { level: 0, titleLine: -1 };
+    const min = Math.min(...levels.map((l: { level: number }) => l.level));
+    const atMin = levels.filter((l: { level: number }) => l.level === min);
+    const firstContent = lines.findIndex((l: string) => l.trim().length > 0);
+    const deeper = levels.filter((l: { level: number }) => l.level > min);
+    // Only a plain title counts ("# My Book"); "# Part One" or "# Chapter 1" is real structure
+    const isPlainTitle = atMin.length === 1 && chParseHeader(lines[atMin[0].line], detection).kind === 'title';
+    if (isPlainTitle && atMin[0].line === firstContent && deeper.length > 0) {
+        return { level: Math.min(...deeper.map((l: { level: number }) => l.level)), titleLine: atMin[0].line };
+    }
+    return { level: min, titleLine: -1 };
+}
+
+/**
+ * Splits imported Markdown into chapters. A *** right before a header is dropped from the
+ * previous chapter (the header style adds its own), so scene breaks are never doubled.
+ */
+function mdmParseMarkdown(
+    text: string,
+    detection: HeaderDetectionOptions,
+    headingSplit: 'auto' | 'all'
+): { docTitle: string; chapters: MdmFileChapter[] } {
+    const lines = (text || "").replace(/\r\n?/g, '\n').split('\n');
+    const split = mdmPickSplitLevel(lines, headingSplit, detection);
+    let docTitle = "";
+
+    const chapters: MdmFileChapter[] = [];
+    let curHeader: ParsedHeader | null = null;
+    let curRaw = "";
+    let curLines: string[] = [];
+    let sawHeader = false;
+
+    const flush = (): void => {
+        const hasContent = curLines.some((l: string) => l.trim() && !chIsDivider(l, detection.breakToken));
+        if (curHeader || hasContent) {
+            chapters.push(mdmMakeFileChapter(chapters.length, curHeader, curRaw, curLines, sawHeader || curHeader ? "Untitled section" : "Opening text"));
+        }
+    };
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (i === split.titleLine) {
+            const t = chParseHeader(line, detection);
+            docTitle = t.isHeader ? (chDisplayTitle(t) || line.replace(/^#+\s*/, '')) : line.replace(/^#+\s*/, '');
+            continue;
+        }
+        const parsed = chParseHeader(line, detection);
+        let startsChapter = false;
+        if (parsed.isHeader) {
+            if (parsed.syntax === 'markdown') {
+                const namesChapter = parsed.kind !== 'title';
+                startsChapter = parsed.level <= split.level || namesChapter;
+            } else {
+                startsChapter = true;
+            }
+        }
+        if (!startsChapter) {
+            curLines.push(line);
+            continue;
+        }
+        // Move a trailing divider (and blank lines) off the previous chapter
+        let j = curLines.length - 1;
+        while (j >= 0 && !curLines[j].trim()) j--;
+        if (j >= 0 && chIsDivider(curLines[j], detection.breakToken)) {
+            curLines = curLines.slice(0, j);
+        }
+        flush();
+        curHeader = parsed;
+        curRaw = line.trim();
+        curLines = [];
+        sawHeader = true;
+    }
+    flush();
+
+    if (chapters.length === 0 && text.trim()) {
+        chapters.push(mdmMakeFileChapter(0, null, "", lines, "Imported text"));
+    }
+    return { docTitle, chapters };
+}
+
+/**
+ * Turns body lines into story paragraphs: one paragraph per non-empty line, blank lines dropped
+ * (or kept as one empty paragraph for 2+ blank lines when preserveBlankLines is on).
+ */
+function mdmBodyParagraphs(lines: string[], preserveBlankLines: boolean, stripEmphasis: boolean, breakToken?: string): string[] {
+    const out: string[] = [];
+    let blankRun = 0;
+    for (const line of lines) {
+        if (!line.trim()) {
+            blankRun++;
+            if (preserveBlankLines && blankRun === 2 && out.length > 0) out.push("");
+            continue;
+        }
+        blankRun = 0;
+        const text = line.trimEnd();
+        out.push(stripEmphasis ? chStripEmphasis(text, breakToken) : text);
+    }
+    while (out.length > 0 && out[out.length - 1] === "") out.pop();
+    return out;
+}
+
+/** Story paragraphs for one imported chapter */
+function mdmRenderFileChapter(ch: MdmFileChapter, settings: MdmImportSettings, atDocumentStart: boolean, breakToken: string): string[] {
+    const out: string[] = [];
+    const headerLine = mdmFormatHeaderLine(ch.header, ch.rawHeader, settings.headerStyle);
+    if (ch.header && settings.includeDivider && !atDocumentStart) out.push(breakToken || "***");
+    if (headerLine) out.push(headerLine);
+    out.push(...mdmBodyParagraphs(ch.bodyLines, settings.preserveBlankLines, settings.stripEmphasis, breakToken));
+    return out;
+}
+
+/** Story paragraphs for several chapters, in order */
+function mdmRenderFileChapters(chapters: MdmFileChapter[], settings: MdmImportSettings, atDocumentStart: boolean, breakToken: string): string[] {
+    const out: string[] = [];
+    chapters.forEach((ch: MdmFileChapter, i: number) => {
+        out.push(...mdmRenderFileChapter(ch, settings, atDocumentStart && i === 0, breakToken));
+    });
+    return out;
+}
+
+// --- Story document -> chapters ---
+
+/** Groups document sections into chapters (used for matching on import and for export) */
+function mdmBuildEditorChapters(sections: { sectionId: number; text: string }[], detection: HeaderDetectionOptions): MdmEditorChapter[] {
+    interface Group { header: ParsedHeader | null; raw: string; ids: number[]; texts: string[]; headerAt: number }
+    const groups: Group[] = [];
+    let cur: Group = { header: null, raw: "", ids: [], texts: [], headerAt: -1 };
+
+    for (const sec of sections) {
+        const text = sec.text || "";
+        const parsed = chParseHeader(text, detection);
+        if (!parsed.isHeader) {
+            cur.ids.push(sec.sectionId);
+            cur.texts.push(text);
+            continue;
+        }
+        // A *** (plus blank lines after it) right above the header belongs to the new chapter
+        let j = cur.texts.length - 1;
+        while (j >= 0 && !cur.texts[j].trim()) j--;
+        let movedIds: number[] = [];
+        let movedTexts: string[] = [];
+        if (j >= 0 && j > cur.headerAt && chIsDivider(cur.texts[j], detection.breakToken)) {
+            movedIds = cur.ids.splice(j);
+            movedTexts = cur.texts.splice(j);
+        }
+        groups.push(cur);
+        const raw = parsed.hasEmbeddedDivider ? text.trim().slice(text.trim().indexOf('\n') + 1).trim() : text.trim();
+        cur = {
+            header: parsed,
+            raw,
+            ids: [...movedIds, sec.sectionId],
+            texts: [...movedTexts, text],
+            headerAt: movedIds.length
+        };
+    }
+    groups.push(cur);
+
+    const chapters: MdmEditorChapter[] = [];
+    const hasAnyHeader = groups.some((g: Group) => g.header !== null);
+    let seenContent = false;
+    for (const g of groups) {
+        if (g.ids.length === 0) continue;
+        const body = g.texts.filter((t: string, i: number) => i !== g.headerAt && t.trim().length > 0 && !(i < g.headerAt && chIsDivider(t, detection.breakToken)));
+        if (!g.header && body.every((t: string) => chIsDivider(t, detection.breakToken))) {
+            // Only blank lines / dividers before the first header: not a chapter
+            continue;
+        }
+        const title = g.header
+            ? (chDisplayTitle(g.header) || g.raw)
+            : (hasAnyHeader ? "Opening text (before first chapter)" : "Whole story (no chapter headers)");
+        chapters.push({
+            key: g.header ? g.ids[g.headerAt] : g.ids[0],
+            index: chapters.length,
+            header: g.header,
+            rawHeader: g.raw,
+            title,
+            sectionIds: g.ids.slice(),
+            bodyTexts: body,
+            wordCount: chCountWords(body.join('\n')),
+            startsDocument: !seenContent
+        });
+        seenContent = true;
+    }
+    return chapters;
+}
+
+// --- Matching imported chapters to story chapters ---
+
+function mdmTitleTokens(text: string): string[] {
+    return chNormalizeTitle(text).split(' ').filter((w: string) => w.length >= 3);
+}
+
+function mdmTitleSimilarity(a: string, b: string): number {
+    const ta = new Set<string>(mdmTitleTokens(a));
+    const tb = new Set<string>(mdmTitleTokens(b));
+    if (ta.size === 0 || tb.size === 0) return 0;
+    let shared = 0;
+    ta.forEach((w: string) => { if (tb.has(w)) shared++; });
+    return shared / (ta.size + tb.size - shared);
+}
+
+/**
+ * Decides, for every imported chapter, whether it replaces a story chapter, is appended, or is
+ * skipped. Manual choices win; each story chapter is replaced at most once; untitled story text
+ * (no header) is never auto-matched.
+ */
+function mdmResolveMatches(
+    imported: MdmFileChapter[],
+    editor: MdmEditorChapter[],
+    manual: Record<number, MdmTargetChoice>,
+    appendUnmatched: boolean
+): MdmChapterMatch[] {
+    const byKey = new Map<number, MdmEditorChapter>();
+    editor.forEach((e: MdmEditorChapter) => byKey.set(e.key, e));
+    const used = new Set<number>();
+    const result = new Map<number, MdmChapterMatch>();
+
+    // 0. Manual choices
+    for (const imp of imported) {
+        const choice = manual[imp.id];
+        if (!choice || choice.mode === 'auto') continue;
+        if (choice.mode === 'editor') {
+            const ed = byKey.get(choice.key);
+            if (ed && !used.has(ed.key)) {
+                used.add(ed.key);
+                result.set(imp.id, { importId: imp.id, action: 'replace', editorKey: ed.key, confidence: 'manual', reason: 'Chosen by you' });
+            }
+            // A target that disappeared from the story falls through to automatic matching
+        } else if (choice.mode === 'append') {
+            result.set(imp.id, { importId: imp.id, action: 'append', editorKey: null, confidence: 'manual', reason: 'Chosen by you: add as a new chapter' });
+        } else {
+            result.set(imp.id, { importId: imp.id, action: 'skip', editorKey: null, confidence: 'manual', reason: 'Chosen by you: skip' });
+        }
+    }
+
+    const candidates = editor.filter((e: MdmEditorChapter) => e.header !== null);
+    const claim = (imp: MdmFileChapter, test: (ed: MdmEditorChapter) => boolean, confidence: MdmMatchConfidence, reason: string): void => {
+        if (result.has(imp.id) || !imp.header) return;
+        const ed = candidates.find((e: MdmEditorChapter) => !used.has(e.key) && test(e));
+        if (!ed) return;
+        used.add(ed.key);
+        result.set(imp.id, { importId: imp.id, action: 'replace', editorKey: ed.key, confidence, reason });
+    };
+
+    // 1. Same title
+    for (const imp of imported) {
+        const impTitle = chNormalizeTitle(imp.title);
+        const impName = imp.header ? chNormalizeTitle(imp.header.cleanName) : "";
+        claim(imp, (ed: MdmEditorChapter) => {
+            const edHeader = ed.header as ParsedHeader;
+            const edName = chNormalizeTitle(edHeader.cleanName);
+            return (impTitle !== "" && impTitle === chNormalizeTitle(ed.title)) || (impName !== "" && impName === edName);
+        }, 'exact', 'Same title');
+    }
+    // 2. Same chapter number (or both prologue / both epilogue)
+    for (const imp of imported) {
+        const h = imp.header;
+        if (!h) continue;
+        claim(imp, (ed: MdmEditorChapter) => {
+            const eh = ed.header as ParsedHeader;
+            if (h.kind === 'prologue' || h.kind === 'epilogue') return eh.kind === h.kind;
+            return h.kind === eh.kind && h.number !== null && h.number === eh.number;
+        }, 'number', h.number !== null ? `Same number (${h.number})` : `Both ${h.kind}`);
+    }
+    // 3. Similar title words
+    for (const imp of imported) {
+        const name = imp.header ? imp.header.cleanName : "";
+        if (!name) continue;
+        claim(imp, (ed: MdmEditorChapter) => mdmTitleSimilarity(name, (ed.header as ParsedHeader).cleanName) >= 0.6, 'title', 'Similar title');
+    }
+
+    return imported.map((imp: MdmFileChapter) => result.get(imp.id) || {
+        importId: imp.id,
+        action: appendUnmatched ? 'append' : 'skip',
+        editorKey: null,
+        confidence: 'none',
+        reason: appendUnmatched ? 'No match: will be added at the end' : 'No match: skipped'
+    } as MdmChapterMatch);
+}
+
+// --- Exporting: story chapters -> Markdown ---
+
+function mdmBuildExportMarkdown(chapters: MdmEditorChapter[], settings: MdmExportSettings, meta: MdmExportMeta, breakToken: string): string {
+    const blocks: string[] = [];
+    const words = chapters.reduce((n: number, c: MdmEditorChapter) => n + c.wordCount, 0);
+    const memory = settings.includeMemory ? meta.memory.trim() : "";
+    const an = settings.includeAuthorsNote ? meta.authorsNote.trim() : "";
+    const clean = (t: string): string => settings.stripEmphasis ? chStripEmphasis(t, breakToken) : t;
+
+    if (settings.frontmatter === 'yaml') {
+        const fm: string[] = ["---", `title: ${mdmYamlString(meta.title || "NovelAI Story")}`];
+        if (meta.author.trim()) fm.push(`author: ${mdmYamlString(meta.author.trim())}`);
+        if (meta.description.trim()) fm.push(`description: ${mdmYamlString(meta.description.trim())}`);
+        fm.push(`date: ${mdmYamlString(meta.date)}`);
+        if (settings.includeStats) {
+            fm.push(`words: ${words}`);
+            fm.push(`chapters: ${chapters.length}`);
+        }
+        // Memory / AN go in the frontmatter so re-importing the file doesn't turn them into chapters
+        if (memory) fm.push(mdmYamlBlock('memory', memory));
+        if (an) fm.push(mdmYamlBlock('authors_note', an));
+        fm.push("---");
+        blocks.push(fm.join('\n'));
+    } else if (settings.frontmatter === 'toml') {
+        const fm: string[] = ["+++", `title = ${mdmTomlString(meta.title || "NovelAI Story")}`];
+        if (meta.author.trim()) fm.push(`author = ${mdmTomlString(meta.author.trim())}`);
+        if (meta.description.trim()) fm.push(`description = ${mdmTomlString(meta.description.trim())}`);
+        fm.push(`date = ${mdmTomlString(meta.date)}`);
+        if (settings.includeStats) {
+            fm.push(`words = ${words}`);
+            fm.push(`chapters = ${chapters.length}`);
+        }
+        if (memory) fm.push(mdmTomlBlock('memory', memory));
+        if (an) fm.push(mdmTomlBlock('authors_note', an));
+        fm.push("+++");
+        blocks.push(fm.join('\n'));
+    } else {
+        if (memory) blocks.push(`## Story Memory\n\n${clean(memory)}`);
+        if (an) blocks.push(`## Author's Note\n\n${clean(an)}`);
+    }
+
+    let headed = 0;
+    for (const ch of chapters) {
+        const heading = mdmFormatHeaderLine(ch.header, ch.rawHeader, settings.headerStyle);
+        const body = ch.bodyTexts.map((p: string) => clean(p.trim())).filter((p: string) => p.length > 0).join('\n\n');
+        const parts: string[] = [];
+        if (heading) {
+            if (settings.includeDivider && headed > 0) parts.push(breakToken || "***");
+            parts.push(heading);
+            headed++;
+        }
+        if (body) parts.push(body);
+        if (parts.length > 0) blocks.push(parts.join('\n\n'));
+    }
+    return blocks.join('\n\n').trim() + '\n';
+}
+
+/** Suggested file name for an export */
+function mdmDefaultFileName(storyTitle: string, chapters: MdmEditorChapter[], scope: MdmExportScope): string {
+    const story = storyTitle || "Story";
+    if (scope === 'selected' && chapters.length === 1) {
+        return mdmSanitizeFileName(`${story} - ${chapters[0].title}`);
+    }
+    return mdmSanitizeFileName(story);
+}
+
+// --- Markdown Manager UI Kit: tokens, presets, component factories, dialogs ---
+
+const MDM_NS = 'mdm';
+const mdmId = (name: string): string => `${MDM_NS}.${name}`;
+
+const MDM_SPACE = { xs: '2px', sm: '4px', md: '8px', lg: '12px' } as const;
+const MDM_RADIUS = { sm: '4px', md: '6px' } as const;
+
+/** Semantic names for NovelAI theme tokens (no hardcoded hex colours) */
+const MDM_COLOR = {
+    canvas: 'bg0',
+    surface: 'bg1',
+    raised: 'bg2',
+    selected: 'bg3',
+    heading: 'textHeadings',
+    body: 'textMain',
+    muted: 'textDisabled',
+    danger: 'warning'
+} as const;
+
+type MdmStyle = Record<string, string>;
+
+const MDM_S: Record<string, MdmStyle> = {
+    card: {
+        backgroundColor: MDM_COLOR.surface,
+        borderStyle: 'solid', borderWidth: '1px', borderColor: MDM_COLOR.raised,
+        borderRadius: MDM_RADIUS.md,
+        padding: MDM_SPACE.md,
+        margin: `${MDM_SPACE.sm} 0`
+    },
+    heading: { color: MDM_COLOR.heading, fontWeight: 'bold', margin: `0 0 ${MDM_SPACE.sm} 0` },
+    body: { color: MDM_COLOR.body, fontSize: '12px' },
+    muted: { color: MDM_COLOR.muted, fontSize: '11px' },
+    mono: { fontFamily: 'code', fontSize: '11px', whiteSpace: 'pre-wrap', color: MDM_COLOR.body }
+};
+MDM_S.cardDanger = { ...MDM_S.card, borderColor: MDM_COLOR.danger };
+
+const mdmSx = (...styles: (MdmStyle | undefined | false)[]): MdmStyle =>
+    Object.assign({}, ...styles.filter(Boolean));
+
+type MdmButtonVariant = 'default' | 'primary' | 'danger' | 'subtle';
+interface MdmButtonOpts { id?: string; icon?: IconId; variant?: MdmButtonVariant; disabled?: boolean; style?: MdmStyle }
+
+const MDM_BUTTON_VARIANTS: Record<MdmButtonVariant, MdmStyle> = {
+    default: { backgroundColor: MDM_COLOR.raised, color: MDM_COLOR.heading },
+    primary: { backgroundColor: MDM_COLOR.selected, color: MDM_COLOR.heading, fontWeight: 'bold' },
+    danger: { backgroundColor: MDM_COLOR.raised, color: MDM_COLOR.danger, border: `1px solid ${MDM_COLOR.danger}`, fontWeight: 'bold' },
+    subtle: { backgroundColor: 'transparent', color: MDM_COLOR.body }
+};
+
+function mdmButton(text: string, onClick: () => void | Promise<void>, opts: MdmButtonOpts = {}): UIPart {
+    return {
+        type: 'button',
+        id: opts.id,
+        text,
+        iconId: opts.icon,
+        disabled: !!opts.disabled,
+        disabledWhileCallbackRunning: true,
+        callback: onClick,
+        style: mdmSx({ margin: MDM_SPACE.xs, padding: `${MDM_SPACE.sm} ${MDM_SPACE.md}`, borderRadius: MDM_RADIUS.sm, fontSize: '12px' },
+            MDM_BUTTON_VARIANTS[opts.variant || 'default'], opts.style)
+    };
+}
+
+function mdmText(value: string, opts: { id?: string; muted?: boolean; markdown?: boolean; style?: MdmStyle } = {}): UIPart {
+    return {
+        type: 'text',
+        id: opts.id,
+        text: value,
+        markdown: opts.markdown !== false,
+        noTemplate: true,
+        style: mdmSx(opts.muted ? MDM_S.muted : MDM_S.body, opts.style)
+    };
+}
+
+function mdmCard(title: string | null, children: UIPart[], opts: { danger?: boolean } = {}): UIPart {
+    const content: UIPart[] = title ? [mdmText(title, { style: MDM_S.heading }), ...children] : children;
+    return { type: 'container', style: opts.danger ? MDM_S.cardDanger : MDM_S.card, content };
+}
+
+function mdmRow(children: UIPart[], opts: { spacing?: UIPartRow['spacing']; wrap?: boolean } = {}): UIPart {
+    return { type: 'row', alignment: 'center', spacing: opts.spacing || 'start', wrap: opts.wrap !== false, content: children };
+}
+
+/**
+ * Collapsible section whose open/closed state is stored, so re-rendering the panel after a click
+ * no longer snaps it shut (the "dropdown closes on its own" bug).
+ */
+function mdmSection(title: string, key: string, children: UIPart[], opts: { collapsed?: boolean; icon?: IconId } = {}): UIPart {
+    return {
+        type: 'collapsibleSection',
+        title,
+        iconId: opts.icon,
+        initialCollapsed: !!opts.collapsed,
+        storageKey: mdmId(`ui.collapsed.${key}`),
+        content: children,
+        style: { margin: `${MDM_SPACE.sm} 0` }
+    };
+}
+
+/** A row of buttons where exactly one is active */
+function mdmSegmented<T extends string>(options: { label: string; value: T }[], current: T, onPick: (value: T) => Promise<void>, disabled: boolean = false): UIPart {
+    return mdmRow(options.map((o: { label: string; value: T }) => mdmButton(o.label, async () => {
+        if (o.value !== current) await onPick(o.value);
+    }, {
+        variant: o.value === current ? 'primary' : 'default',
+        disabled,
+        style: { flex: '1 1 auto', fontSize: '11px' }
+    })));
+}
+
+/** On/off option shown as a checkbox-style button (a button click can safely re-render) */
+function mdmToggle(label: string, value: boolean, onToggle: (next: boolean) => Promise<void>, disabled: boolean = false): UIPart {
+    return mdmButton(label, async () => { await onToggle(!value); }, {
+        icon: value ? 'check-square' : 'square',
+        variant: value ? 'primary' : 'subtle',
+        disabled,
+        style: { width: '100%', textAlign: 'left', fontWeight: 'normal', fontSize: '12px' }
+    });
+}
+
+/** Yes/no dialog. Resolves before closing so the closed-handler fallback never wins. */
+async function mdmConfirm(title: string, message: string, confirmText: string, danger: boolean = false): Promise<boolean> {
+    const picked = await mdmChoose<boolean>(title, message, [
+        { label: 'Cancel', value: false, variant: 'subtle' },
+        { label: confirmText, value: true, variant: danger ? 'danger' : 'primary' }
+    ]);
+    return picked === true;
+}
+
+/** Shows a list of choices; resolves with the chosen value, or null if the dialog is closed */
+async function mdmChoose<T>(
+    title: string,
+    message: string,
+    options: { label: string; value: T; variant?: MdmButtonVariant; icon?: IconId }[],
+    vertical: boolean = false
+): Promise<T | null> {
+    return new Promise<T | null>(async (resolve: (value: T | null) => void) => {
+        let done = false;
+        const finish = (value: T | null): void => {
+            if (!done) {
+                done = true;
+                resolve(value);
+            }
+        };
+        const buttons: UIPart[] = options.map((o: { label: string; value: T; variant?: MdmButtonVariant; icon?: IconId }) =>
+            mdmButton(o.label, async () => { finish(o.value); await modal.close(); }, {
+                variant: o.variant,
+                icon: o.icon,
+                style: vertical ? { width: '100%', textAlign: 'left' } : {}
+            }));
+        const modal = await api.v1.ui.modal.open({
+            title,
+            size: 'small',
+            content: [
+                mdmText(message),
+                vertical ? { type: 'column', alignment: 'start', content: buttons } : mdmRow(buttons, { spacing: 'end' })
+            ]
+        });
+        modal.closed.then(() => finish(null));
+    });
+}
+
+async function mdmNotify(message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info'): Promise<void> {
+    await api.v1.ui.toast(message, { id: mdmId('toast'), type });
+}
+
+// --- Markdown Manager State, Settings & Document Helpers ---
+
+const MDM_SETTINGS_KEY = mdmId('settings');
+const MDM_KEY_FILENAME = mdmId('export.filename');
+const MDM_KEY_AUTHOR = mdmId('export.author');
+const MDM_BATCH_SIZE = 40;
+
+const MDM_IMPORT_STYLES: MdmHeaderStyle[] = ['bracket', 'bracket_title', 'clean', 'markdown_h1', 'raw', 'none'];
+const MDM_EXPORT_STYLES: MdmHeaderStyle[] = ['markdown_h1', 'markdown_h2', 'bracket', 'bracket_title', 'clean', 'raw', 'none'];
+
+function mdmDefaultSettings(): MdmSettings {
+    return {
+        tab: 'import',
+        import: {
+            headerStyle: 'bracket',
+            includeDivider: true,
+            stripEmphasis: false,
+            preserveBlankLines: false,
+            appendUnmatched: true,
+            target: 'document'
+        },
+        export: {
+            headerStyle: 'markdown_h1',
+            includeDivider: false,
+            stripEmphasis: false,
+            frontmatter: 'yaml',
+            includeStats: true,
+            includeMemory: false,
+            includeAuthorsNote: false,
+            stripAfterExport: false,
+            scope: 'all'
+        }
+    };
+}
+
+const mdmState: MdmState = {
+    settings: mdmDefaultSettings(),
+    detection: { detectionMode: 'auto', detectBracketedTitles: true, breakToken: '***' },
+    headingSplit: 'auto',
+    file: null,
+    manualTargets: {},
+    editorChapters: [],
+    hasScanned: false,
+    storyTitle: "",
+    exportSelected: new Set<number>(),
+    exportKnownKeys: new Set<number>(),
+    busy: false
+};
+
+function mdmBreakToken(): string {
+    return mdmState.detection.breakToken || '***';
+}
+
+async function mdmLoadConfigAndSettings(): Promise<void> {
+    const getStr = async (name: string, fallback: string): Promise<string> => {
+        try {
+            const v = await api.v1.config.get(name);
+            return (typeof v === 'string' && v.trim()) ? v.trim() : fallback;
+        } catch {
+            return fallback;
+        }
+    };
+    const getBool = async (name: string, fallback: boolean): Promise<boolean> => {
+        try {
+            const v = await api.v1.config.get(name);
+            return typeof v === 'boolean' ? v : fallback;
+        } catch {
+            return fallback;
+        }
+    };
+
+    const defaults = mdmDefaultSettings();
+    const importStyle = await getStr('default_import_header', 'bracket') as MdmHeaderStyle;
+    const exportStyle = await getStr('default_export_header', 'markdown_h1') as MdmHeaderStyle;
+    if (MDM_IMPORT_STYLES.includes(importStyle)) defaults.import.headerStyle = importStyle;
+    if (MDM_EXPORT_STYLES.includes(exportStyle)) defaults.export.headerStyle = exportStyle;
+    defaults.import.preserveBlankLines = await getBool('preserve_blank_lines', false);
+
+    const mode = await getStr('chapter_detection_mode', 'auto');
+    mdmState.detection = {
+        detectionMode: mode === 'markdown_headings' ? 'markdown_headings' : 'auto',
+        detectBracketedTitles: await getBool('detect_bracketed_titles', true),
+        breakToken: await getStr('chapter_break_token', '***')
+    };
+    mdmState.headingSplit = (await getStr('import_heading_split', 'auto')) === 'all' ? 'all' : 'auto';
+
+    // Panel choices saved from last time win over config defaults
+    try {
+        const saved = await api.v1.storage.get(MDM_SETTINGS_KEY);
+        if (saved && typeof saved === 'object') {
+            mdmState.settings = {
+                tab: saved.tab === 'export' ? 'export' : 'import',
+                import: { ...defaults.import, ...(saved.import || {}) },
+                export: { ...defaults.export, ...(saved.export || {}) }
+            };
+            return;
+        }
+    } catch (err: any) {
+        api.v1.log("Markdown Manager: could not read saved settings", err);
+    }
+    mdmState.settings = defaults;
+}
+
+async function mdmSaveSettings(): Promise<void> {
+    try {
+        await api.v1.storage.set(MDM_SETTINGS_KEY, mdmState.settings);
+    } catch (err: any) {
+        api.v1.log("Markdown Manager: could not save settings", err);
+    }
+}
+
+async function mdmEnsurePermission(name: 'documentEdit' | 'storyEdit' | 'fileInput' | 'fileDownload', why: string): Promise<boolean> {
+    if (await api.v1.permissions.has(name)) return true;
+    const granted = await api.v1.permissions.request(name, why);
+    if (!granted) await mdmNotify(`Permission "${name}" is needed for this.`, 'warning');
+    return granted;
+}
+
+/** Fresh read of the story's chapters */
+async function mdmScanEditor(): Promise<MdmEditorChapter[]> {
+    const scanned = await api.v1.document.scan();
+    const sections = (scanned || []).map((s: { sectionId: number; section: Section }) => ({
+        sectionId: s.sectionId,
+        text: (s.section && s.section.text) || ""
+    }));
+    const chapters = mdmBuildEditorChapters(sections, mdmState.detection);
+    mdmState.editorChapters = chapters;
+    mdmState.hasScanned = true;
+    // New chapters start ticked for export; ticks on chapters that still exist are kept
+    const live = new Set<number>(chapters.map((c: MdmEditorChapter) => c.key));
+    for (const c of chapters) {
+        if (!mdmState.exportKnownKeys.has(c.key)) {
+            mdmState.exportKnownKeys.add(c.key);
+            mdmState.exportSelected.add(c.key);
+        }
+    }
+    mdmState.exportSelected.forEach((k: number) => { if (!live.has(k)) mdmState.exportSelected.delete(k); });
+    return chapters;
+}
+
+async function mdmDocumentIsEmpty(): Promise<boolean> {
+    const scanned = await api.v1.document.scan();
+    return !(scanned || []).some((s: { section: Section }) => s.section && s.section.text && s.section.text.trim().length > 0);
+}
+
+/** Inserts paragraphs after `anchorId` in batches, keeping their order */
+async function mdmInsertAfter(anchorId: number, paragraphs: string[], onProgress?: (done: number, total: number) => Promise<void>): Promise<void> {
+    let anchor = anchorId;
+    for (let i = 0; i < paragraphs.length; i += MDM_BATCH_SIZE) {
+        const batch = paragraphs.slice(i, i + MDM_BATCH_SIZE);
+        await api.v1.document.insertParagraphsAfter(anchor, batch.map((text: string) => ({ text })));
+        if (i + MDM_BATCH_SIZE < paragraphs.length) {
+            const ids = await api.v1.document.sectionIds();
+            const at = ids.indexOf(anchor);
+            if (at === -1) throw new Error("Lost track of the insert position in the story.");
+            anchor = ids[at + batch.length];
+            await api.v1.timers.sleep(30);
+        }
+        if (onProgress) await onProgress(Math.min(i + MDM_BATCH_SIZE, paragraphs.length), paragraphs.length);
+    }
+}
+
+async function mdmAppend(paragraphs: string[], onProgress?: (done: number, total: number) => Promise<void>): Promise<void> {
+    for (let i = 0; i < paragraphs.length; i += MDM_BATCH_SIZE) {
+        const batch = paragraphs.slice(i, i + MDM_BATCH_SIZE);
+        await api.v1.document.appendParagraphs(batch.map((text: string) => ({ text })));
+        if (onProgress) await onProgress(Math.min(i + MDM_BATCH_SIZE, paragraphs.length), paragraphs.length);
+        if (i + MDM_BATCH_SIZE < paragraphs.length) await api.v1.timers.sleep(30);
+    }
+}
+
+async function mdmRemove(ids: number[]): Promise<void> {
+    for (let i = 0; i < ids.length; i += 100) {
+        await api.v1.document.removeParagraphs(ids.slice(i, i + 100));
+        if (i + 100 < ids.length) await api.v1.timers.sleep(30);
+    }
+}
+
+/**
+ * Replaces a run of sections with new paragraphs in place. The first section is kept as the
+ * anchor (updated, not deleted), so this works the same at the top of the story, in the middle,
+ * and for the whole document.
+ */
+async function mdmReplaceSections(ids: number[], paragraphs: string[], onProgress?: (done: number, total: number) => Promise<void>): Promise<void> {
+    if (ids.length === 0) throw new Error("Nothing to replace.");
+    const paras = paragraphs.length > 0 ? paragraphs : [""];
+    const anchor = ids[0];
+    if (ids.length > 1) await mdmRemove(ids.slice(1));
+    await api.v1.document.updateParagraph(anchor, { text: paras[0] });
+    if (paras.length > 1) await mdmInsertAfter(anchor, paras.slice(1), onProgress);
+}
+
+// --- Markdown Manager: Import Actions ---
+
+const MDM_STATUS_ID = mdmId('status');
+
+async function mdmSetStatus(text: string): Promise<void> {
+    try {
+        await api.v1.ui.updateParts([{ type: 'text', id: MDM_STATUS_ID, text }]);
+    } catch {
+        // The status line may not be mounted yet; the next render shows the final state
+    }
+}
+
+/** Runs a story-changing action with the panel locked and errors reported */
+async function mdmRunBusy(label: string, work: () => Promise<void>): Promise<void> {
+    if (mdmState.busy) return;
+    mdmState.busy = true;
+    await mdmRender();
+    await mdmSetStatus(label);
+    try {
+        await work();
+    } catch (err: any) {
+        api.v1.error(`Markdown Manager: ${label} failed`, err);
+        await mdmNotify(`${label} failed: ${err?.message || String(err)}`, 'error');
+    } finally {
+        mdmState.busy = false;
+        await mdmRender();
+    }
+}
+
+function mdmLoadText(raw: string): MdmLoadedFile {
+    const fm = mdmStripFrontmatter(raw);
+    const parsed = mdmParseMarkdown(fm.text, mdmState.detection, mdmState.headingSplit);
+    return {
+        title: fm.title || parsed.docTitle || "Imported file",
+        hasFrontmatter: fm.hasFrontmatter,
+        sizeBytes: mdmUtf8Length(raw),
+        chapters: parsed.chapters
+    };
+}
+
+async function mdmPickFile(): Promise<void> {
+    if (!(await mdmEnsurePermission('fileInput', 'Needed to read the Markdown file you pick.'))) return;
+    try {
+        const result = await api.v1.file.prompt({ accept: '.md,.markdown,.txt,text/markdown,text/plain', readAs: 'text' });
+        if (typeof result !== 'string' || !result.trim()) return;
+        mdmState.file = mdmLoadText(result);
+        mdmState.manualTargets = {};
+        await mdmScanEditor();
+        await mdmRender();
+        await mdmNotify(`Loaded "${mdmState.file.title}": ${mdmState.file.chapters.length} chapter(s).`, 'success');
+    } catch (err: any) {
+        api.v1.error("Markdown Manager: file read failed", err);
+        await mdmNotify(`Couldn't read the file: ${err?.message || String(err)}`, 'error');
+    }
+}
+
+function mdmCurrentMatches(): MdmChapterMatch[] {
+    if (!mdmState.file) return [];
+    return mdmResolveMatches(mdmState.file.chapters, mdmState.editorChapters, mdmState.manualTargets, mdmState.settings.import.appendUnmatched);
+}
+
+/** Lets the user pick where one imported chapter goes */
+async function mdmChooseTarget(chapter: MdmFileChapter): Promise<void> {
+    await mdmScanEditor();
+    const options: { label: string; value: MdmTargetChoice; variant?: MdmButtonVariant; icon?: IconId }[] = [
+        { label: 'Automatic match', value: { mode: 'auto' }, icon: 'zap', variant: 'subtle' },
+        { label: 'Add as a new chapter at the end', value: { mode: 'append' }, icon: 'plus', variant: 'subtle' },
+        { label: "Don't import this chapter", value: { mode: 'skip' }, icon: 'slash', variant: 'subtle' }
+    ];
+    for (const ed of mdmState.editorChapters) {
+        options.push({ label: `Replace: ${ed.title} (${ed.wordCount.toLocaleString()}w)`, value: { mode: 'editor', key: ed.key }, icon: 'refresh-cw' });
+    }
+    const choice = await mdmChoose<MdmTargetChoice>(
+        'Where should this chapter go?',
+        `**${chapter.title}** (${chapter.wordCount.toLocaleString()} words)`,
+        options,
+        true
+    );
+    if (!choice) return;
+    // Each story chapter can only be replaced once: free it from any other imported chapter
+    if (choice.mode === 'editor') {
+        for (const [id, other] of Object.entries(mdmState.manualTargets) as [string, MdmTargetChoice][]) {
+            if (Number(id) !== chapter.id && other.mode === 'editor' && other.key === choice.key) {
+                mdmState.manualTargets[Number(id)] = { mode: 'auto' };
+            }
+        }
+    }
+    mdmState.manualTargets[chapter.id] = choice;
+    await mdmRender();
+}
+
+async function mdmImportAppendAll(): Promise<void> {
+    const file = mdmState.file;
+    if (!file) return;
+    if (!(await mdmEnsurePermission('documentEdit', 'Needed to add the imported text to your story.'))) return;
+    await mdmRunBusy('Adding to story', async () => {
+        const atStart = await mdmDocumentIsEmpty();
+        const paragraphs = mdmRenderFileChapters(file.chapters, mdmState.settings.import, atStart, mdmBreakToken());
+        await mdmAppend(paragraphs, async (done: number, total: number) => mdmSetStatus(`Adding to story: ${Math.round(done / total * 100)}%`));
+        await mdmScanEditor();
+        const words = file.chapters.reduce((n: number, c: MdmFileChapter) => n + c.wordCount, 0);
+        await mdmNotify(`Added ${words.toLocaleString()} words to the story.`, 'success');
+    });
+}
+
+async function mdmImportApplyMatches(): Promise<void> {
+    const file = mdmState.file;
+    if (!file) return;
+    if (!(await mdmEnsurePermission('documentEdit', 'Needed to replace chapters in your story.'))) return;
+
+    // Plan against the story as it is now, not as it was when the panel was drawn
+    const editor = await mdmScanEditor();
+    const matches = mdmCurrentMatches();
+    const replaces = matches.filter((m: MdmChapterMatch) => m.action === 'replace');
+    const appends = matches.filter((m: MdmChapterMatch) => m.action === 'append');
+    if (replaces.length === 0 && appends.length === 0) {
+        await mdmNotify("Nothing to do: every chapter is set to skip.", 'warning');
+        return;
+    }
+
+    const byKey = new Map<number, MdmEditorChapter>();
+    editor.forEach((e: MdmEditorChapter) => byKey.set(e.key, e));
+    const byId = new Map<number, MdmFileChapter>();
+    file.chapters.forEach((c: MdmFileChapter) => byId.set(c.id, c));
+
+    const lines: string[] = [];
+    for (const m of replaces) {
+        const ed = byKey.get(m.editorKey as number);
+        lines.push(`- **${(byId.get(m.importId) as MdmFileChapter).title}** replaces **${ed ? ed.title : '?'}**`);
+    }
+    if (appends.length > 0) lines.push(`- ${appends.length} chapter(s) added at the end`);
+    const ok = await mdmConfirm('Replace chapters?',
+        `${lines.join('\n')}\n\nThe replaced chapters' current text is overwritten. You can undo with Ctrl+Z.`,
+        replaces.length > 0 ? `Replace ${replaces.length}` : `Add ${appends.length}`, replaces.length > 0);
+    if (!ok) return;
+
+    await mdmRunBusy('Replacing chapters', async () => {
+        const settings = mdmState.settings.import;
+        // Bottom-up, so earlier chapters' sections are untouched while later ones change
+        const ordered = replaces.slice().sort((a: MdmChapterMatch, b: MdmChapterMatch) =>
+            (byKey.get(b.editorKey as number) as MdmEditorChapter).index - (byKey.get(a.editorKey as number) as MdmEditorChapter).index);
+        let n = 0;
+        for (const m of ordered) {
+            const ed = byKey.get(m.editorKey as number) as MdmEditorChapter;
+            const imp = byId.get(m.importId) as MdmFileChapter;
+            n++;
+            await mdmSetStatus(`Replacing "${ed.title}" (${n}/${ordered.length})`);
+            await mdmReplaceSections(ed.sectionIds, mdmRenderFileChapter(imp, settings, ed.startsDocument, mdmBreakToken()));
+            await api.v1.timers.sleep(30);
+        }
+        if (appends.length > 0) {
+            await mdmSetStatus(`Adding ${appends.length} new chapter(s)`);
+            const atStart = await mdmDocumentIsEmpty();
+            const newChapters = appends.map((m: MdmChapterMatch) => byId.get(m.importId) as MdmFileChapter);
+            await mdmAppend(mdmRenderFileChapters(newChapters, settings, atStart, mdmBreakToken()));
+        }
+        mdmState.manualTargets = {};
+        await mdmScanEditor();
+        const added = appends.length > 0 ? ` and added ${appends.length}` : '';
+        await mdmNotify(`Replaced ${replaces.length} chapter(s)${added}.`, 'success');
+    });
+}
+
+async function mdmImportReplaceStory(): Promise<void> {
+    const file = mdmState.file;
+    if (!file) return;
+    if (!(await mdmEnsurePermission('documentEdit', 'Needed to replace your story text.'))) return;
+    const ok = await mdmConfirm('Replace the entire story?',
+        `Every paragraph in the story is replaced with **${file.title}** (${file.chapters.length} chapter(s)). You can undo with Ctrl+Z.`,
+        'Replace story', true);
+    if (!ok) return;
+    await mdmRunBusy('Replacing story', async () => {
+        const ids = await api.v1.document.sectionIds();
+        const paragraphs = mdmRenderFileChapters(file.chapters, mdmState.settings.import, true, mdmBreakToken());
+        if (ids.length === 0) {
+            await mdmAppend(paragraphs);
+        } else {
+            await mdmReplaceSections(ids, paragraphs, async (done: number, total: number) => mdmSetStatus(`Writing story: ${Math.round(done / total * 100)}%`));
+        }
+        mdmState.manualTargets = {};
+        await mdmScanEditor();
+        await mdmNotify(`Story replaced with "${file.title}".`, 'success');
+    });
+}
+
+async function mdmImportToMemory(overwrite: boolean): Promise<void> {
+    const file = mdmState.file;
+    if (!file) return;
+    if (!(await mdmEnsurePermission('storyEdit', 'Needed to change Story Memory.'))) return;
+    if (overwrite) {
+        const ok = await mdmConfirm('Overwrite Memory?', "Your current Story Memory is replaced with the imported text.", 'Overwrite', true);
+        if (!ok) return;
+    }
+    await mdmRunBusy('Updating Memory', async () => {
+        const text = mdmRenderFileChapters(file.chapters, mdmState.settings.import, true, mdmBreakToken()).join('\n');
+        if (overwrite) {
+            await api.v1.memory.set(text);
+        } else {
+            const current = await api.v1.memory.get();
+            await api.v1.memory.set(current && current.trim() ? `${current}\n\n${text}` : text);
+        }
+        await mdmNotify(overwrite ? "Memory overwritten." : "Added to Memory.", 'success');
+    });
+}
+
+// --- Markdown Manager: Export Actions ---
+
+const MDM_EXPORT_STATS_ID = mdmId('export.stats');
+const MDM_EXPORT_PREVIEW_ID = mdmId('export.preview');
+const MDM_PREVIEW_CHARS = 600;
+
+function mdmExportTargets(): MdmEditorChapter[] {
+    if (mdmState.settings.export.scope === 'all') return mdmState.editorChapters;
+    return mdmState.editorChapters.filter((c: MdmEditorChapter) => mdmState.exportSelected.has(c.key));
+}
+
+async function mdmGatherExportMeta(): Promise<MdmExportMeta> {
+    const safe = async (get: () => Promise<string>): Promise<string> => {
+        try {
+            return (await get()) || "";
+        } catch {
+            return "";
+        }
+    };
+    const settings = mdmState.settings.export;
+    const title = await safe(() => api.v1.story.title.get());
+    mdmState.storyTitle = title.trim();
+    return {
+        title: title.trim(),
+        author: String((await api.v1.storage.get(MDM_KEY_AUTHOR)) || ""),
+        description: await safe(() => api.v1.story.description.get()),
+        memory: settings.includeMemory ? await safe(() => api.v1.memory.get()) : "",
+        authorsNote: settings.includeAuthorsNote ? await safe(() => api.v1.an.get()) : "",
+        date: new Date().toISOString().split('T')[0]
+    };
+}
+
+async function mdmBuildCurrentExport(): Promise<{ markdown: string; chapters: MdmEditorChapter[] }> {
+    const chapters = mdmExportTargets();
+    const meta = await mdmGatherExportMeta();
+    return { markdown: mdmBuildExportMarkdown(chapters, mdmState.settings.export, meta, mdmBreakToken()), chapters };
+}
+
+function mdmExportStatsText(markdown: string, chapters: MdmEditorChapter[]): string {
+    const total = mdmState.editorChapters.length;
+    if (chapters.length === 0) return `**0** of ${total} chapters selected. Tick at least one chapter to export.`;
+    const words = chCountWords(markdown);
+    return `**${chapters.length}** of ${total} chapters · **${words.toLocaleString()}** words · ~**${mdmEstimateTokens(markdown.length).toLocaleString()}** tokens`;
+}
+
+function mdmPreviewText(markdown: string): string {
+    if (markdown.length <= MDM_PREVIEW_CHARS) return markdown;
+    return `${markdown.slice(0, MDM_PREVIEW_CHARS)}\n… ${(markdown.length - MDM_PREVIEW_CHARS).toLocaleString()} more characters`;
+}
+
+/** Refreshes only the stats line and preview (no full re-render, so ticking boxes stays smooth) */
+async function mdmRefreshExportSummary(): Promise<void> {
+    try {
+        const { markdown, chapters } = await mdmBuildCurrentExport();
+        await api.v1.ui.updateParts([
+            { type: 'text', id: MDM_EXPORT_STATS_ID, text: mdmExportStatsText(markdown, chapters) },
+            { type: 'text', id: MDM_EXPORT_PREVIEW_ID, text: chapters.length > 0 ? mdmPreviewText(markdown) : "Nothing selected." }
+        ]);
+    } catch (err: any) {
+        api.v1.log("Markdown Manager: export summary refresh failed", err);
+    }
+}
+
+async function mdmSetAllSelected(selected: boolean): Promise<void> {
+    for (const c of mdmState.editorChapters) {
+        if (selected) mdmState.exportSelected.add(c.key);
+        else mdmState.exportSelected.delete(c.key);
+        // Bound checkboxes follow their storage key
+        await api.v1.tempStorage.set(mdmId(`export.sel.${c.key}`), selected);
+    }
+    await mdmRefreshExportSummary();
+}
+
+async function mdmRunExport(): Promise<void> {
+    const settings = mdmState.settings.export;
+    if (!(await mdmEnsurePermission('fileDownload', 'Needed to save the Markdown file.'))) return;
+    if (settings.stripAfterExport && !(await mdmEnsurePermission('documentEdit', 'Needed to remove exported chapters from the story.'))) return;
+
+    // Build from a fresh scan so the file and the strip step both match the story right now
+    await mdmScanEditor();
+    const { markdown, chapters } = await mdmBuildCurrentExport();
+    if (chapters.length === 0) {
+        await mdmNotify("Select at least one chapter to export.", 'warning');
+        await mdmRender();
+        return;
+    }
+
+    const allSections = await api.v1.document.sectionIds();
+    const stripIds = new Set<number>();
+    chapters.forEach((c: MdmEditorChapter) => c.sectionIds.forEach((id: number) => stripIds.add(id)));
+    const wipesStory = settings.stripAfterExport && allSections.every((id: number) => stripIds.has(id) || false);
+
+    if (settings.stripAfterExport) {
+        const ok = await mdmConfirm('Export and remove from story?',
+            `After saving, **${chapters.length} chapter(s)** are removed from the story${wipesStory ? ' (that is the whole story)' : ''}. You can undo with Ctrl+Z.`,
+            'Export & remove', true);
+        if (!ok) return;
+    }
+
+    const typed = String((await api.v1.tempStorage.get(MDM_KEY_FILENAME)) || "").trim();
+    const fileName = typed ? mdmSanitizeFileName(typed) : mdmDefaultFileName(mdmState.storyTitle, chapters, settings.scope);
+
+    await mdmRunBusy('Exporting', async () => {
+        await api.v1.file.save(fileName, markdown);
+        const words = chCountWords(markdown).toLocaleString();
+        if (!settings.stripAfterExport) {
+            await mdmNotify(`Exported ${words} words to "${fileName}".`, 'success');
+            return;
+        }
+        await mdmSetStatus('Removing exported chapters');
+        const ids = allSections.filter((id: number) => stripIds.has(id));
+        if (wipesStory && ids.length > 0) {
+            // The editor always keeps one paragraph: blank the first instead of deleting it
+            await mdmRemove(ids.slice(1));
+            await api.v1.document.updateParagraph(ids[0], { text: "" });
+        } else {
+            await mdmRemove(ids);
+        }
+        await mdmScanEditor();
+        await mdmNotify(`Exported ${words} words to "${fileName}" and removed ${chapters.length} chapter(s) from the story.`, 'success');
+    });
+}
+
+// --- Markdown Manager: Panel Rendering ---
+
+const MDM_PANEL_ID = mdmId('panel');
+
+const MDM_IMPORT_STYLE_OPTIONS: { label: string; value: MdmHeaderStyle }[] = [
+    { label: '[ Chapter 1: Title ]', value: 'bracket' },
+    { label: '[ Title ]', value: 'bracket_title' },
+    { label: 'Chapter 1: Title', value: 'clean' },
+    { label: '# Heading', value: 'markdown_h1' },
+    { label: 'As written', value: 'raw' },
+    { label: 'No header', value: 'none' }
+];
+
+const MDM_EXPORT_STYLE_OPTIONS: { label: string; value: MdmHeaderStyle }[] = [
+    { label: '# Heading 1', value: 'markdown_h1' },
+    { label: '## Heading 2', value: 'markdown_h2' },
+    { label: '[ Chapter 1: Title ]', value: 'bracket' },
+    { label: '[ Title ]', value: 'bracket_title' },
+    { label: 'Chapter 1: Title', value: 'clean' },
+    { label: 'As written', value: 'raw' },
+    { label: 'No header', value: 'none' }
+];
+
+/** Applies a settings change, saves it and re-renders (only ever called from button clicks) */
+async function mdmUpdateSettings(change: (s: MdmSettings) => void): Promise<void> {
+    change(mdmState.settings);
+    await mdmSaveSettings();
+    await mdmRender();
+}
+
+function mdmMatchLabel(m: MdmChapterMatch): string {
+    if (m.action === 'skip') return 'skip';
+    if (m.action === 'append') return 'add at end';
+    const ed = mdmState.editorChapters.find((e: MdmEditorChapter) => e.key === m.editorKey);
+    return `replaces **${ed ? ed.title : '?'}**${ed ? ` (${ed.wordCount.toLocaleString()}w)` : ''}`;
+}
+
+function mdmImportView(): UIPart[] {
+    const s = mdmState.settings.import;
+    const busy = mdmState.busy;
+    const file = mdmState.file;
+    const parts: UIPart[] = [];
+
+    parts.push(mdmRow([
+        mdmButton(file ? 'Choose another file' : 'Choose .md / .txt file', mdmPickFile, { icon: 'upload', variant: file ? 'default' : 'primary', disabled: busy, style: { flex: '1 1 auto' } }),
+        ...(file ? [mdmButton('Clear', async () => {
+            mdmState.file = null;
+            mdmState.manualTargets = {};
+            await mdmRender();
+        }, { icon: 'x', variant: 'subtle', disabled: busy })] : [])
+    ]));
+
+    if (!file) {
+        parts.push(mdmText("Load a Markdown or text file to add it to your story or Memory. Chapter headers in the file are matched to the chapters already in your story.", { muted: true }));
+        return parts;
+    }
+
+    const rendered = mdmRenderFileChapters(file.chapters, s, false, mdmBreakToken());
+    const renderedText = rendered.join('\n');
+    const words = file.chapters.reduce((n: number, c: MdmFileChapter) => n + c.wordCount, 0);
+    parts.push(mdmCard(null, [
+        mdmText(`**${file.title}**${file.hasFrontmatter ? ' · frontmatter removed' : ''} · ${mdmFormatSize(file.sizeBytes)}`),
+        mdmText(`**${file.chapters.length}** chapter(s) · **${words.toLocaleString()}** words · ~**${mdmEstimateTokens(renderedText.length).toLocaleString()}** tokens`, { muted: true })
+    ]));
+
+    parts.push(mdmSection('Formatting', 'import.format', [
+        mdmText('Chapter header style', { muted: true }),
+        mdmSegmented(MDM_IMPORT_STYLE_OPTIONS, s.headerStyle, async (v: MdmHeaderStyle) => mdmUpdateSettings((x: MdmSettings) => { x.import.headerStyle = v; }), busy),
+        mdmToggle(`Put ${mdmBreakToken()} above each chapter header`, s.includeDivider, async (v: boolean) => mdmUpdateSettings((x: MdmSettings) => { x.import.includeDivider = v; }), busy),
+        mdmToggle('Remove *italic* / **bold** markers', s.stripEmphasis, async (v: boolean) => mdmUpdateSettings((x: MdmSettings) => { x.import.stripEmphasis = v; }), busy),
+        mdmToggle('Keep blank-line scene breaks', s.preserveBlankLines, async (v: boolean) => mdmUpdateSettings((x: MdmSettings) => { x.import.preserveBlankLines = v; }), busy)
+    ], { icon: 'sliders' }));
+
+    parts.push(mdmText('Send to', { muted: true, style: { marginTop: MDM_SPACE.sm } }));
+    parts.push(mdmSegmented<MdmImportTarget>([{ label: 'Story', value: 'document' }, { label: 'Memory', value: 'memory' }], s.target,
+        async (v: MdmImportTarget) => mdmUpdateSettings((x: MdmSettings) => { x.import.target = v; }), busy));
+
+    if (s.target === 'memory') {
+        parts.push(mdmCard('Memory', [
+            mdmRow([
+                mdmButton('Add to Memory', async () => mdmImportToMemory(false), { icon: 'file-plus', variant: 'primary', disabled: busy }),
+                mdmButton('Overwrite Memory', async () => mdmImportToMemory(true), { icon: 'alert', variant: 'danger', disabled: busy })
+            ])
+        ]));
+    } else {
+        parts.push(mdmCard('Add to the end', [
+            mdmText('Appends every chapter after the current story text.', { muted: true }),
+            mdmButton(`Append ${file.chapters.length} chapter(s)`, mdmImportAppendAll, { icon: 'file-plus', variant: 'primary', disabled: busy })
+        ]));
+
+        const matches = mdmCurrentMatches();
+        const replaceCount = matches.filter((m: MdmChapterMatch) => m.action === 'replace').length;
+        const appendCount = matches.filter((m: MdmChapterMatch) => m.action === 'append').length;
+        const rows: UIPart[] = [];
+        if (!mdmState.hasScanned || mdmState.editorChapters.length === 0) {
+            rows.push(mdmText('No chapters found in the story yet.', { muted: true }));
+        }
+        file.chapters.forEach((ch: MdmFileChapter, i: number) => {
+            const m = matches[i];
+            rows.push(mdmRow([
+                mdmText(`**${ch.title}** (${ch.wordCount.toLocaleString()}w) ${mdmMatchLabel(m)}${m.confidence === 'manual' ? ' · *your pick*' : ''}`, { style: { flex: '1 1 140px' } }),
+                mdmButton('Change', async () => mdmChooseTarget(ch), { icon: 'edit-2', variant: 'subtle', disabled: busy, style: { fontSize: '11px' } })
+            ], { spacing: 'space-between' }));
+        });
+        parts.push(mdmCard('Replace matching chapters', [
+            mdmText(`Story has **${mdmState.editorChapters.filter((e: MdmEditorChapter) => e.header).length}** chapter(s). Matched by title, then chapter number.`, { muted: true }),
+            ...rows,
+            mdmToggle('Add unmatched chapters at the end', s.appendUnmatched, async (v: boolean) => mdmUpdateSettings((x: MdmSettings) => { x.import.appendUnmatched = v; }), busy),
+            mdmRow([
+                mdmButton(`Apply (${replaceCount} replace, ${appendCount} add)`, mdmImportApplyMatches, { icon: 'check', variant: 'primary', disabled: busy || (replaceCount + appendCount === 0) }),
+                mdmButton('Re-scan story', async () => { await mdmScanEditor(); await mdmRender(); }, { icon: 'refresh-cw', disabled: busy })
+            ])
+        ]));
+
+        parts.push(mdmCard('Replace the entire story', [
+            mdmText('Deletes all story text and writes the file in its place.', { muted: true }),
+            mdmButton('Replace entire story', mdmImportReplaceStory, { icon: 'alert', variant: 'danger', disabled: busy })
+        ], { danger: true }));
+    }
+
+    parts.push(mdmSection('Preview', 'import.preview', [
+        mdmText(mdmPreviewText(renderedText) || '(empty)', { markdown: false, style: MDM_S.mono })
+    ], { collapsed: true, icon: 'eye' }));
+    return parts;
+}
+
+async function mdmExportView(): Promise<UIPart[]> {
+    const s = mdmState.settings.export;
+    const busy = mdmState.busy;
+    const parts: UIPart[] = [];
+    const { markdown, chapters } = await mdmBuildCurrentExport();
+
+    parts.push(mdmCard(null, [
+        mdmText(`**${mdmState.storyTitle || 'Untitled story'}**`),
+        mdmText(mdmExportStatsText(markdown, chapters), { id: MDM_EXPORT_STATS_ID, muted: true }),
+        mdmButton('Re-scan story', async () => { await mdmScanEditor(); await mdmRender(); }, { icon: 'refresh-cw', variant: 'subtle', disabled: busy })
+    ]));
+
+    if (mdmState.editorChapters.length === 0) {
+        parts.push(mdmText('The story is empty, so there is nothing to export yet.', { muted: true }));
+        return parts;
+    }
+
+    const chapterParts: UIPart[] = [
+        mdmSegmented<MdmExportScope>([{ label: 'Whole story', value: 'all' }, { label: 'Selected chapters', value: 'selected' }], s.scope,
+            async (v: MdmExportScope) => mdmUpdateSettings((x: MdmSettings) => { x.export.scope = v; }), busy)
+    ];
+    if (s.scope === 'selected') {
+        chapterParts.push(mdmRow([
+            mdmButton('Select all', async () => mdmSetAllSelected(true), { icon: 'check-square', variant: 'subtle', disabled: busy }),
+            mdmButton('Deselect all', async () => mdmSetAllSelected(false), { icon: 'square', variant: 'subtle', disabled: busy })
+        ]));
+        for (const c of mdmState.editorChapters) {
+            const key = c.key;
+            chapterParts.push({
+                type: 'checkboxInput',
+                label: `${c.title} (${c.wordCount.toLocaleString()}w)`,
+                storageKey: `temp:${mdmId(`export.sel.${key}`)}`,
+                disabled: busy,
+                onChange: async (value: boolean) => {
+                    if (value) mdmState.exportSelected.add(key);
+                    else mdmState.exportSelected.delete(key);
+                    await mdmRefreshExportSummary();
+                }
+            });
+        }
+    }
+    parts.push(mdmSection('Chapters', 'export.chapters', chapterParts, { icon: 'list' }));
+
+    parts.push(mdmSection('Formatting', 'export.format', [
+        mdmText('Chapter heading style', { muted: true }),
+        mdmSegmented(MDM_EXPORT_STYLE_OPTIONS, s.headerStyle, async (v: MdmHeaderStyle) => mdmUpdateSettings((x: MdmSettings) => { x.export.headerStyle = v; }), busy),
+        mdmToggle(`Put ${mdmBreakToken()} between chapters`, s.includeDivider, async (v: boolean) => mdmUpdateSettings((x: MdmSettings) => { x.export.includeDivider = v; }), busy),
+        mdmToggle('Remove *italic* / **bold** markers', s.stripEmphasis, async (v: boolean) => mdmUpdateSettings((x: MdmSettings) => { x.export.stripEmphasis = v; }), busy)
+    ], { icon: 'sliders' }));
+
+    parts.push(mdmSection('Frontmatter & extras', 'export.extras', [
+        mdmSegmented<MdmFrontmatter>([{ label: 'YAML ---', value: 'yaml' }, { label: 'TOML +++', value: 'toml' }, { label: 'None', value: 'none' }], s.frontmatter,
+            async (v: MdmFrontmatter) => mdmUpdateSettings((x: MdmSettings) => { x.export.frontmatter = v; }), busy),
+        mdmToggle('Word and chapter counts in frontmatter', s.includeStats, async (v: boolean) => mdmUpdateSettings((x: MdmSettings) => { x.export.includeStats = v; }), busy || s.frontmatter === 'none'),
+        { type: 'textInput', label: 'Author', placeholder: 'Optional', storageKey: MDM_KEY_AUTHOR, disabled: busy },
+        mdmToggle('Include Story Memory', s.includeMemory, async (v: boolean) => mdmUpdateSettings((x: MdmSettings) => { x.export.includeMemory = v; }), busy),
+        mdmToggle("Include Author's Note", s.includeAuthorsNote, async (v: boolean) => mdmUpdateSettings((x: MdmSettings) => { x.export.includeAuthorsNote = v; }), busy),
+        mdmText('With frontmatter on, Memory and Author\'s Note are saved inside it, so re-importing the file won\'t turn them into chapters.', { muted: true })
+    ], { collapsed: true, icon: 'file-text' }));
+
+    parts.push(mdmCard(s.stripAfterExport ? 'Export & remove' : 'Export', [
+        { type: 'textInput', label: 'File name', placeholder: mdmDefaultFileName(mdmState.storyTitle, chapters, s.scope), storageKey: `temp:${MDM_KEY_FILENAME}`, disabled: busy },
+        mdmToggle('Remove exported chapters from the story', s.stripAfterExport, async (v: boolean) => mdmUpdateSettings((x: MdmSettings) => { x.export.stripAfterExport = v; }), busy),
+        ...(s.stripAfterExport ? [mdmText(s.scope === 'all'
+            ? '**Whole story** is selected: exporting will empty the story. Ctrl+Z still works.'
+            : 'Exported chapters are deleted from the story after the file is saved. Ctrl+Z still works.', { style: { color: MDM_COLOR.danger, fontSize: '11px' } })] : []),
+        mdmButton(s.stripAfterExport ? 'Export & remove' : 'Export Markdown', mdmRunExport, {
+            icon: s.stripAfterExport ? 'scissors' : 'download',
+            variant: s.stripAfterExport ? 'danger' : 'primary',
+            disabled: busy || chapters.length === 0,
+            style: { width: '100%' }
+        })
+    ], { danger: s.stripAfterExport }));
+
+    parts.push(mdmSection('Preview', 'export.preview', [
+        mdmText(chapters.length > 0 ? mdmPreviewText(markdown) : 'Nothing selected.', { id: MDM_EXPORT_PREVIEW_ID, markdown: false, style: MDM_S.mono })
+    ], { collapsed: true, icon: 'eye' }));
+    return parts;
+}
+
+async function mdmRender(): Promise<void> {
+    try {
+        const tab = mdmState.settings.tab;
+        const content: UIPart[] = [
+            mdmSegmented<MdmTab>([{ label: 'Import', value: 'import' }, { label: 'Export', value: 'export' }], tab, async (v: MdmTab) => {
+                if (v === 'export') await mdmScanEditor();
+                await mdmUpdateSettings((x: MdmSettings) => { x.tab = v; });
+            }, mdmState.busy),
+            mdmText(mdmState.busy ? 'Working…' : '', { id: MDM_STATUS_ID, muted: true })
+        ];
+        if (tab === 'export') {
+            // Keep bound checkboxes in step with the selection before drawing them
+            for (const c of mdmState.editorChapters) {
+                await api.v1.tempStorage.set(mdmId(`export.sel.${c.key}`), mdmState.exportSelected.has(c.key));
+            }
+            content.push(...(await mdmExportView()));
+        } else {
+            content.push(...mdmImportView());
+        }
+        await api.v1.ui.update([{ type: 'sidebarPanel', id: MDM_PANEL_ID, name: 'Markdown', iconId: 'file-text', content }]);
+    } catch (err: any) {
+        api.v1.error("Markdown Manager: render failed", err);
+    }
+}
+
+// --- Markdown Manager: Startup & Hooks ---
+
+async function mdmInit(): Promise<void> {
+    try {
+        await mdmLoadConfigAndSettings();
+        try {
+            mdmState.storyTitle = ((await api.v1.story.title.get()) || "").trim();
+        } catch {
+            mdmState.storyTitle = "";
+        }
+        await mdmScanEditor();
+        await mdmRender();
+    } catch (err: any) {
+        api.v1.error("Markdown Manager: initialization failed", err);
+    }
+}
+
+mdmInit().catch((err: any) => api.v1.error("Markdown Manager: init error", err));
+
+// Keep the export list current after generations and undo/redo
+api.v1.hooks.register('onGenerationEnd', async () => {
+    if (mdmState.busy || mdmState.settings.tab !== 'export') return;
+    await mdmScanEditor();
+    await mdmRender();
+});
+
+api.v1.hooks.register('onHistoryNavigated', async () => {
+    if (mdmState.busy) return;
+    await mdmScanEditor();
+    await mdmRender();
+});
